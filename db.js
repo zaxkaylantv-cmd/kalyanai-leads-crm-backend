@@ -513,6 +513,107 @@ function getDealWithLead(dealId, callback) {
   );
 }
 
+function getDealsWithLeadAndLastActivity(callback) {
+  db.all(
+    `
+    SELECT
+      d.*,
+      l.name AS leadName,
+      l.company AS leadCompany,
+      l.email AS leadEmail,
+      la.type AS lastActivityType,
+      la.createdAt AS lastActivityDate
+    FROM deals d
+    LEFT JOIN leads l ON l.id = d.leadId
+    LEFT JOIN (
+      SELECT a.dealId, a.type, a.createdAt
+      FROM activities a
+      INNER JOIN (
+        SELECT dealId, MAX(datetime(createdAt)) AS maxDate
+        FROM activities
+        GROUP BY dealId
+      ) latest ON latest.dealId = a.dealId AND datetime(a.createdAt) = latest.maxDate
+    ) la ON la.dealId = d.id
+    `,
+    [],
+    (err, rows) => {
+      if (err) {
+        return callback(err);
+      }
+      callback(null, rows || []);
+    },
+  );
+}
+
+function getDealContextForMessageDraft(dealId, callback) {
+  db.get(
+    `
+    SELECT
+      d.id AS dealId,
+      d.leadId,
+      d.title AS dealName,
+      d.stage,
+      d.value AS valueGBP,
+      d.nextAction,
+      d.nextActionDate,
+      l.name AS leadName,
+      l.company,
+      l.email,
+      l.phone
+    FROM deals d
+    LEFT JOIN leads l ON l.id = d.leadId
+    WHERE d.id = ?
+    `,
+    [dealId],
+    (err, row) => {
+      if (err) {
+        console.error('Error fetching deal context:', err);
+        return callback(err);
+      }
+
+      if (!row) {
+        return callback(null, null);
+      }
+
+      db.get(
+        `
+        SELECT type, note, createdAt
+        FROM activities
+        WHERE dealId = ?
+        ORDER BY datetime(createdAt) DESC
+        LIMIT 1
+        `,
+        [dealId],
+        (actErr, activity) => {
+          if (actErr) {
+            console.error('Error fetching last activity for deal:', actErr);
+          }
+
+          const context = {
+            leadId: row.leadId,
+            dealId: row.dealId,
+            leadName: row.leadName || null,
+            company: row.company || null,
+            role: null,
+            email: row.email || null,
+            phone: row.phone || null,
+            stage: row.stage || null,
+            dealName: row.dealName || null,
+            valueGBP: row.valueGBP != null ? Number(row.valueGBP) : null,
+            productsOrServices: null,
+            keyBenefits: null,
+            lastActivityType: activity ? activity.type : null,
+            lastActivityDate: activity ? activity.createdAt : null,
+            lastActivityNotes: activity ? activity.note : null,
+          };
+
+          return callback(null, context);
+        },
+      );
+    },
+  );
+}
+
 module.exports = {
   db,
   initialiseDb,
@@ -525,4 +626,6 @@ module.exports = {
   createDeal,
   updateDealDetails,
   deleteLeadAndRelated,
+  getDealsWithLeadAndLastActivity,
+  getDealContextForMessageDraft,
 };

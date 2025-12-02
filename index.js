@@ -15,6 +15,8 @@ const {
   createDeal,
   updateDealDetails,
   deleteLeadAndRelated,
+  getDealsWithLeadAndLastActivity,
+  getDealContextForMessageDraft,
 } = require('./db');
 
 const app = express();
@@ -620,6 +622,192 @@ Channel: ${channel}
         message: fallback,
         source: 'fallback',
       });
+    }
+  });
+});
+
+app.post('/ai/message-draft', (req, res) => {
+  const { dealId, intent, channel, userNotes } = req.body || {};
+
+  if (!dealId || !intent || !channel) {
+    return res.status(400).json({ error: 'dealId, intent and channel are required' });
+  }
+
+  getDealContextForMessageDraft(dealId, async (err, context) => {
+    if (err) {
+      console.error('Error fetching deal context for message draft:', err);
+      return res.status(500).json({ error: 'Failed to generate message draft' });
+    }
+
+    if (!context) {
+      return res.status(404).json({ error: 'Deal not found' });
+    }
+
+    const input = {
+      appName: 'lead_desk',
+      businessContext:
+        'Kalyan AI builds custom AI and automation systems to save time, reduce errors and increase profitability for business owners.',
+      intent,
+      channel,
+      leadProfile: {
+        name: context.leadName,
+        company: context.company,
+        role: context.role,
+        email: context.email,
+        phone: context.phone,
+        timezone: null,
+      },
+      dealContext: {
+        stage: context.stage,
+        dealName: context.dealName,
+        valueGBP: context.valueGBP,
+        productsOrServices: context.productsOrServices,
+        keyBenefits: context.keyBenefits,
+        decisionMakers: null,
+      },
+      recentHistory: {
+        summary: null,
+        lastContactType: context.lastActivityType,
+        lastContactDate: context.lastActivityDate,
+        lastContactNotes: context.lastActivityNotes,
+      },
+      userNotes: userNotes || null,
+      constraints: {
+        maxWords: 250,
+        tone: 'default',
+        includeCalendarLink: false,
+        calendarLinkUrl: null,
+        dueDate: null,
+      },
+    };
+
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: 'Failed to generate message draft' });
+    }
+
+    try {
+      const systemPrompt =
+        'You are the Global Outreach Copilot for Kalyan AI. Draft outreach tailored to the intent and channel. Be clear, confident, and helpful, without hype. Use GBP (£). Never invent discounts, guarantees, or precise dates not provided. Respond with VALID JSON ONLY in this shape: {"channel":"email|whatsapp|sms|call_script","subject":string|null,"body":string,"toneSummary":string,"rationale":string,"safetyNotes":string}.';
+
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4.1-mini',
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: systemPrompt },
+          {
+            role: 'user',
+            content: JSON.stringify({ input }),
+          },
+        ],
+        max_tokens: 400,
+      });
+
+      const content = completion.choices?.[0]?.message?.content;
+      let parsed;
+      try {
+        parsed = content ? JSON.parse(content) : null;
+      } catch (parseErr) {
+        throw parseErr;
+      }
+
+      if (!parsed || typeof parsed !== 'object') {
+        throw new Error('Invalid AI response format');
+      }
+
+      return res.json(parsed);
+    } catch (aiErr) {
+      console.error('Error from OpenAI for message-draft:', aiErr);
+      return res.status(500).json({ error: 'Failed to generate message draft' });
+    }
+  });
+});
+
+app.get('/ai/leads-summary', (req, res) => {
+  getDealsWithLeadAndLastActivity(async (err, rows) => {
+    if (err) {
+      console.error('Error loading deals for leads summary:', err);
+      return res.status(500).json({ error: 'Failed to generate AI leads summary' });
+    }
+
+    const deals = rows || [];
+    const today = new Date();
+    const todayStr = today.toISOString().slice(0, 10);
+    const msPerDay = 1000 * 60 * 60 * 24;
+
+    const compactDeals = deals.map((deal) => {
+      let daysSinceLastContact = null;
+      if (deal.lastActivityDate) {
+        const lastDate = new Date(deal.lastActivityDate);
+        if (!Number.isNaN(lastDate.getTime())) {
+          daysSinceLastContact = Math.floor((today.getTime() - lastDate.getTime()) / msPerDay);
+        }
+      }
+
+      return {
+        leadId: deal.leadId,
+        dealId: deal.id,
+        leadName: deal.leadName,
+        company: deal.leadCompany,
+        stage: deal.stage,
+        value: Number.isFinite(deal.value) ? Number(deal.value) : 0,
+        nextAction: deal.nextAction,
+        nextActionDate: deal.nextActionDate,
+        lastActivityType: deal.lastActivityType || null,
+        lastActivityDate: deal.lastActivityDate || null,
+        daysSinceLastContact,
+      };
+    });
+
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: 'Failed to generate AI leads summary' });
+    }
+
+    try {
+      const systemPrompt =
+        'You are a concise sales coach creating a daily briefing for the Leads page. Respond with STRICT JSON only.';
+
+      const instructions =
+        'Assume today is provided. Prioritise: 1) deals with nextActionDate today or overdue, 2) higher-value Qualified/Proposal Sent with no recent contact, 3) New leads with no first contact. For each topActions item include actionType (call/email/whatsapp/sms/meeting), why, and suggestedStep. Keep everything concise, skimmable, and use GBP (£). If little data, keep lists short and explain briefly.';
+
+      const userPayload = {
+        task: 'leads_daily_brief',
+        today: todayStr,
+        deals: compactDeals,
+        instructions,
+      };
+
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4.1-mini',
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: systemPrompt },
+          {
+            role: 'user',
+            content: JSON.stringify(userPayload),
+          },
+        ],
+        max_tokens: 500,
+      });
+
+      const content = completion.choices?.[0]?.message?.content;
+      let parsed;
+      try {
+        parsed = content ? JSON.parse(content) : null;
+      } catch (parseErr) {
+        throw parseErr;
+      }
+
+      if (!parsed || typeof parsed !== 'object') {
+        throw new Error('Invalid AI response format');
+      }
+
+      return res.json({
+        ...parsed,
+        source: 'openai:gpt-4.1-mini',
+      });
+    } catch (aiErr) {
+      console.error('Error from OpenAI for leads-summary:', aiErr);
+      return res.status(500).json({ error: 'Failed to generate AI leads summary' });
     }
   });
 });
