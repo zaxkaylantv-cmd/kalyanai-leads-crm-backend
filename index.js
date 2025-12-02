@@ -8,6 +8,7 @@ const {
   db,
   initialiseDb,
   createLead,
+  getLeads,
   getDealWithLead,
   createActivity,
   getActivitiesForDeal,
@@ -47,7 +48,7 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/leads', (req, res) => {
-  db.all('SELECT * FROM leads', [], (err, rows) => {
+  getLeads((err, rows) => {
     if (err) {
       console.error('Error fetching leads:', err);
       return res.status(500).json({ error: 'Failed to fetch leads' });
@@ -76,6 +77,7 @@ app.post('/deals', (req, res) => {
     nextActionDate,
     reminderChannel,
     aiAutoReminderEnabled,
+    ownerName,
   } = req.body || {};
 
   if (!leadId || typeof leadId !== 'string' || !leadId.trim()) {
@@ -94,6 +96,7 @@ app.post('/deals', (req, res) => {
     nextActionDate: nextActionDate || null,
     reminderChannel: typeof reminderChannel === 'string' ? reminderChannel.trim() : null,
     aiAutoReminderEnabled: !!aiAutoReminderEnabled,
+    ownerName: ownerName && typeof ownerName === 'string' ? ownerName : 'Unassigned',
   };
 
   createDeal(dealInput, (err, createdDeal) => {
@@ -550,6 +553,7 @@ app.post('/leads', (req, res) => {
     createdAt,
     address,
     phone,
+    ownerName,
   } = req.body || {};
 
   if (!name || !company) {
@@ -569,6 +573,7 @@ app.post('/leads', (req, res) => {
     createdAt,
     address,
     phone,
+    ownerName: ownerName && typeof ownerName === 'string' ? ownerName : 'Unassigned',
   };
 
   createLead(lead, (err) => {
@@ -605,7 +610,10 @@ app.post('/ai/next-step', (req, res) => {
       return res.status(404).json({ error: 'Deal not found' });
     }
 
-    const { stage, nextAction, nextActionDate, leadName, leadCompany } = record;
+    const { stage, nextAction, nextActionDate, leadName, leadCompany, ownerName } = record;
+    const ownerLabel =
+      (ownerName && typeof ownerName === 'string' && ownerName.trim()) ||
+      'Unassigned';
 
     if (!process.env.OPENAI_API_KEY) {
       const suggestion =
@@ -615,14 +623,19 @@ app.post('/ai/next-step', (req, res) => {
 
     try {
       const systemPrompt =
-        'You are a concise sales coach. Given a B2B deal and existing next action, suggest ONE clear "next best step" for the salesperson, in 2-3 sentences max. Focus on moving the deal forward, not generic advice.';
+        'You are a concise sales coach. Given a B2B deal and existing next action, suggest ONE clear "next best step" for the salesperson, in 2-3 sentences max. Focus on moving the deal forward, not generic advice. Use the ownerName field from the input context. The suggestedAction text should start with the ownerName followed by a dash, e.g., "Zax Kalyan – Call Gemma tomorrow to confirm the proposal and clarify any concerns."';
 
       const userContext = `
-Deal stage: ${stage || 'unknown'}
-Client name: ${leadName || 'unknown'}
-Company: ${leadCompany || 'unknown'}
-Next action on record: ${nextAction || 'not specified'}
-Next action due date: ${nextActionDate || 'not specified'}
+{
+  "dealId": "${dealId}",
+  "stage": "${stage || 'unknown'}",
+  "value": ${Number.isFinite(record.value) ? Number(record.value) : 0},
+  "leadName": "${leadName || 'unknown'}",
+  "company": "${leadCompany || 'unknown'}",
+  "ownerName": "${ownerLabel}",
+  "nextAction": "${nextAction || 'not specified'}",
+  "nextActionDate": "${nextActionDate || 'not specified'}"
+}
 `;
 
       const completion = await openai.chat.completions.create({
@@ -675,6 +688,10 @@ app.post('/ai/deal-recovery', (req, res) => {
       }
 
       const activities = activityRows || [];
+      const ownerLabel =
+        (deal.ownerName && typeof deal.ownerName === 'string' && deal.ownerName.trim()) ||
+        (deal.leadOwnerName && typeof deal.leadOwnerName === 'string' && deal.leadOwnerName.trim()) ||
+        'Unassigned';
 
       const context = {
         deal: {
@@ -690,6 +707,7 @@ app.post('/ai/deal-recovery', (req, res) => {
           company: deal.leadCompany,
           email: deal.leadEmail,
         },
+        ownerName: ownerLabel,
         activities: activities.map((a) => ({
           type: a.type,
           note: a.note,
@@ -802,14 +820,14 @@ app.post('/ai/deal-recovery', (req, res) => {
             {
               role: 'system',
               content:
-                'You are a sales coach helping with deals at any stage. Always respond in JSON.',
+                'You are a sales coach helping with deals at any stage. Always respond in JSON. Use the ownerName field and address the owner directly. All primary suggestion strings should start with "<ownerName> – " (e.g., "Ram Sharma – Re-open the conversation by acknowledging the delay and offering a focused, time-boxed call to clarify the proposal.").',
             },
             {
               role: 'user',
               content: JSON.stringify({
                 task: 'analyse_deal',
                 instructions:
-                  'You are a sales coach. Use the CURRENT stage as the source of truth. If stage is "Lost", focus on why it was lost and how to revive/re-open. If stage is "New" or "Qualified", treat it as an active opportunity and focus on clarifying fit, priorities, and next steps. If stage is "Proposal Sent", focus on closing, handling objections, and follow-up strategy. If stage is "Won", focus on onboarding, expansion, and strengthening the relationship. NEVER describe the deal as lost unless the stage is exactly "Lost". Use the rep\'s notes and activity history to make advice concrete. Respond in JSON with keys reasonSummary, recoveryIdeas (array of short bullet-style strings), and messageTemplate (a concise outreach email or message). Use GBP / £ if you reference amounts.',
+                  'You are a sales coach. Use the CURRENT stage as the source of truth. If stage is "Lost", focus on why it was lost and how to revive/re-open. If stage is "New" or "Qualified", treat it as an active opportunity and focus on clarifying fit, priorities, and next steps. If stage is "Proposal Sent", focus on closing, handling objections, and follow-up strategy. If stage is "Won", focus on onboarding, expansion, and strengthening the relationship. NEVER describe the deal as lost unless the stage is exactly "Lost". Use the rep\'s notes and activity history to make advice concrete. Respond in JSON with keys reasonSummary, recoveryIdeas (array of short bullet-style strings), and messageTemplate (a concise outreach email or message). Each reasonSummary and recoveryIdeas item should start with "<ownerName> – " addressing the owner. Use GBP / £ if you reference amounts.',
                 context,
               }),
             },
@@ -958,6 +976,9 @@ app.post('/ai/message-draft', (req, res) => {
         'Kalyan AI builds custom AI and automation systems to save time, reduce errors and increase profitability for business owners.',
       intent,
       channel,
+      ownerName: (context.dealOwnerName && context.dealOwnerName.trim()) || 'Unassigned',
+      senderName:
+        (context.dealOwnerName && context.dealOwnerName.trim()) || 'Your sales advisor',
       leadProfile: {
         name: context.leadName,
         company: context.company,
@@ -996,7 +1017,7 @@ app.post('/ai/message-draft', (req, res) => {
 
     try {
       const systemPrompt =
-        'You are the Global Outreach Copilot for Kalyan AI. Draft outreach tailored to the intent and channel. Be clear, confident, and helpful, without hype. Use GBP (£). Never invent discounts, guarantees, or precise dates not provided. Respond with VALID JSON ONLY in this shape: {"channel":"email|whatsapp|sms|call_script","subject":string|null,"body":string,"toneSummary":string,"rationale":string,"safetyNotes":string}.';
+        'You are the Global Outreach Copilot for Kalyan AI. Draft outreach tailored to the intent and channel. Be clear, confident, and helpful, without hype. Use GBP (£). Never invent discounts, guarantees, or precise dates not provided. Use senderName from the input as the human sending the message. Write the body as if it is from senderName to the client, and include an appropriate sign-off with the sender’s name for email/whatsapp/sms. Do NOT prefix the content with the owner name plus a dash; write it like a normal outbound message. Respond with VALID JSON ONLY in this shape: {"channel":"email|whatsapp|sms|call_script","subject":string|null,"body":string,"toneSummary":string,"rationale":string,"safetyNotes":string}.';
 
       const completion = await openai.chat.completions.create({
         model: 'gpt-4.1-mini',
@@ -1064,6 +1085,7 @@ app.get('/ai/leads-summary', (req, res) => {
         lastActivityType: deal.lastActivityType || null,
         lastActivityDate: deal.lastActivityDate || null,
         daysSinceLastContact,
+        ownerName: (deal.ownerName && deal.ownerName.trim()) || (deal.leadOwnerName && deal.leadOwnerName.trim()) || 'Unassigned',
       };
     });
 
@@ -1073,10 +1095,10 @@ app.get('/ai/leads-summary', (req, res) => {
 
     try {
       const systemPrompt =
-        'You are a concise sales coach creating a daily briefing for the Leads page. Respond with STRICT JSON only.';
+        'You are a concise sales coach creating a daily briefing for the Leads page. You MUST respond with a single valid JSON object only. No markdown, no commentary, no backticks.';
 
       const instructions =
-        'Assume today is provided. Prioritise: 1) deals with nextActionDate today or overdue, 2) higher-value Qualified/Proposal Sent with no recent contact, 3) New leads with no first contact. For each topActions item include actionType (call/email/whatsapp/sms/meeting), why, and suggestedStep. Keep everything concise, skimmable, and use GBP (£). If little data, keep lists short and explain briefly.';
+        'Assume today is provided. Prioritise: 1) deals with nextActionDate today or overdue, 2) higher-value Qualified/Proposal Sent with no recent contact, 3) New leads with no first contact. For each action item in todaysTopActions, overdueAtRisk, and newAndWarming, prefix the line with ownerName and a dash (e.g., "Zax Kalyan – Call Gemma about The Green Man (Proposal Sent, 3 days since last contact)."). Use ownerName from the input; if missing or Unassigned, use "Owner". For each topActions item include actionType (call/email/whatsapp/sms/meeting), why, and suggestedStep. Keep everything concise, skimmable, and use GBP (£). If little data, keep lists short and explain briefly. Respond ONLY with valid JSON (no trailing commas).';
 
       const userPayload = {
         task: 'leads_daily_brief',
@@ -1103,6 +1125,7 @@ app.get('/ai/leads-summary', (req, res) => {
       try {
         parsed = content ? JSON.parse(content) : null;
       } catch (parseErr) {
+        console.error('Failed to parse AI leads summary JSON:', content);
         throw parseErr;
       }
 
@@ -1127,7 +1150,8 @@ app.get('/ai/pipeline-insights', (req, res) => {
     SELECT
       d.*,
       l.name AS leadName,
-      l.company AS leadCompany
+      l.company AS leadCompany,
+      l.ownerName AS leadOwnerName
     FROM deals d
     LEFT JOIN leads l ON l.id = d.leadId
     `,
@@ -1181,14 +1205,17 @@ app.get('/ai/pipeline-insights', (req, res) => {
 
       try {
         const compactDeals = deals
-          .map(
-            (d) =>
-              `• ${d.id}: ${d.title || 'Untitled'} | stage=${d.stage || 'unknown'} | value=£${d.value ?? 0} | lead=${d.leadName || 'unknown'} @ ${d.leadCompany || 'unknown'}`,
-          )
+          .map((d) => {
+            const ownerLabel =
+              (d.ownerName && typeof d.ownerName === 'string' && d.ownerName.trim()) ||
+              (d.leadOwnerName && typeof d.leadOwnerName === 'string' && d.leadOwnerName.trim()) ||
+              'Unassigned';
+            return `• ${d.id}: ${d.title || 'Untitled'} | stage=${d.stage || 'unknown'} | value=£${d.value ?? 0} | lead=${d.leadName || 'unknown'} @ ${d.leadCompany || 'unknown'} | owner=${ownerLabel}`;
+          })
           .join('\n');
 
         const systemPrompt =
-          'You are a concise revenue coach. Given pipeline stats and a compact deal list, return STRICT JSON with keys "snapshot" and "coaching" only. Keep each value to 2-3 sentences. Be specific and action-oriented. All amounts are in GBP (British Pounds); use the £ symbol.';
+          'You are a concise revenue coach. Given pipeline stats and a compact deal list, return STRICT JSON with keys "snapshot" and "coaching" only. Keep each value to 2-3 sentences. Be specific and action-oriented. All amounts are in GBP (British Pounds); use the £ symbol. Use ownerName on each deal to mention who should act; in coaching, reference the owner when suggesting next best moves. If ownerName is Unassigned/missing, refer to "the team".';
 
         const userContext = `
 Pipeline stats:

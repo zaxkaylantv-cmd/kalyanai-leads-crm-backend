@@ -12,6 +12,57 @@ if (!fs.existsSync(DATA_DIR)) {
 
 const db = new sqlite3.Database(DB_PATH);
 
+function ensureOwnerColumns(dbInstance, callback) {
+  dbInstance.all('PRAGMA table_info(leads);', (leadErr, leadCols) => {
+    if (leadErr) {
+      console.error('Error reading leads schema:', leadErr);
+      return callback(leadErr);
+    }
+
+    const leadsHasOwner = Array.isArray(leadCols) && leadCols.some((col) => col.name === 'ownerName');
+
+    const addOwnerToLeads = (next) => {
+      if (leadsHasOwner) return next();
+      dbInstance.run(
+        `ALTER TABLE leads ADD COLUMN ownerName TEXT DEFAULT 'Unassigned';`,
+        (alterErr) => {
+          if (alterErr) {
+            console.error('Error adding ownerName to leads:', alterErr);
+            return callback(alterErr);
+          }
+          next();
+        },
+      );
+    };
+
+    addOwnerToLeads(() => {
+      dbInstance.all('PRAGMA table_info(deals);', (dealErr, dealCols) => {
+        if (dealErr) {
+          console.error('Error reading deals schema:', dealErr);
+          return callback(dealErr);
+        }
+
+        const dealsHasOwner = Array.isArray(dealCols) && dealCols.some((col) => col.name === 'ownerName');
+
+        if (dealsHasOwner) {
+          return callback(null);
+        }
+
+        dbInstance.run(
+          `ALTER TABLE deals ADD COLUMN ownerName TEXT DEFAULT 'Unassigned';`,
+          (alterErr) => {
+            if (alterErr) {
+              console.error('Error adding ownerName to deals:', alterErr);
+              return callback(alterErr);
+            }
+            callback(null);
+          },
+        );
+      });
+    });
+  });
+}
+
 function initialiseDb() {
   db.serialize(() => {
     db.run(
@@ -24,7 +75,8 @@ function initialiseDb() {
         source TEXT,
         createdAt TEXT,
         address TEXT,
-        phone TEXT
+        phone TEXT,
+        ownerName TEXT DEFAULT 'Unassigned'
       )`,
     );
 
@@ -39,6 +91,7 @@ function initialiseDb() {
         nextActionDate TEXT,
         reminderChannel TEXT,
         aiAutoReminderEnabled INTEGER,
+        ownerName TEXT DEFAULT 'Unassigned',
         FOREIGN KEY (leadId) REFERENCES leads(id)
       )`,
     );
@@ -75,7 +128,12 @@ function initialiseDb() {
       },
     );
 
-    seedDemoData();
+    ensureOwnerColumns(db, (err) => {
+      if (err) {
+        console.error('Failed to ensure owner columns exist:', err);
+      }
+      seedDemoData();
+    });
   });
 }
 
@@ -90,12 +148,17 @@ function createLead(lead, callback) {
     createdAt,
     address,
     phone,
+    ownerName,
   } = lead;
+  const ownerValue =
+    ownerName && typeof ownerName === 'string' && ownerName.trim()
+      ? ownerName.trim()
+      : 'Unassigned';
 
   db.run(
     `
-    INSERT INTO leads (id, name, company, email, value, source, createdAt, address, phone)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO leads (id, name, company, email, value, source, createdAt, address, phone, ownerName)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
     [
       id,
@@ -107,12 +170,40 @@ function createLead(lead, callback) {
       createdAt || new Date().toISOString(),
       address || null,
       phone || null,
+      ownerValue,
     ],
     function (err) {
       if (err) {
         return callback(err);
       }
       callback(null);
+    },
+  );
+}
+
+function getLeads(callback) {
+  db.all(
+    `
+    SELECT
+      id,
+      name,
+      company,
+      email,
+      value,
+      source,
+      createdAt,
+      address,
+      phone,
+      ownerName
+    FROM leads
+    `,
+    [],
+    (err, rows) => {
+      if (err) {
+        console.error('Error fetching leads:', err);
+        return callback(err);
+      }
+      callback(null, rows || []);
     },
   );
 }
@@ -218,7 +309,12 @@ function createDeal(deal, callback) {
     nextActionDate = null,
     reminderChannel = null,
     aiAutoReminderEnabled = 0,
+    ownerName,
   } = deal;
+  const ownerValue =
+    ownerName && typeof ownerName === 'string' && ownerName.trim()
+      ? ownerName.trim()
+      : 'Unassigned';
 
   db.run(
     `
@@ -231,8 +327,9 @@ function createDeal(deal, callback) {
       nextAction,
       nextActionDate,
       reminderChannel,
-      aiAutoReminderEnabled
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      aiAutoReminderEnabled,
+      ownerName
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
     [
       id,
@@ -244,6 +341,7 @@ function createDeal(deal, callback) {
       nextActionDate,
       reminderChannel,
       aiAutoReminderEnabled ? 1 : 0,
+      ownerValue,
     ],
     function (err) {
       if (err) {
@@ -410,7 +508,7 @@ function seedDemoData() {
     db.serialize(() => {
       // Leads
       db.run(
-        'INSERT INTO leads (id, name, company, email, value, source, createdAt, address, phone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO leads (id, name, company, email, value, source, createdAt, address, phone, ownerName) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [
           'lead-1',
           'Sarah Thompson',
@@ -421,10 +519,11 @@ function seedDemoData() {
           '2025-11-20T09:15:00.000Z',
           'Unit 4, Riverside Park, Leeds',
           '+44 113 555 0123',
+          'Unassigned',
         ],
       );
       db.run(
-        'INSERT INTO leads (id, name, company, email, value, source, createdAt, address, phone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO leads (id, name, company, email, value, source, createdAt, address, phone, ownerName) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [
           'lead-2',
           'James Patel',
@@ -435,10 +534,11 @@ function seedDemoData() {
           '2025-11-18T13:45:00.000Z',
           'Suite 12, City Gate, Manchester',
           '+44 161 555 0456',
+          'Unassigned',
         ],
       );
       db.run(
-        'INSERT INTO leads (id, name, company, email, value, source, createdAt, address, phone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO leads (id, name, company, email, value, source, createdAt, address, phone, ownerName) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [
           'lead-3',
           'Emily Carter',
@@ -449,10 +549,11 @@ function seedDemoData() {
           '2025-11-10T10:30:00.000Z',
           'High Street 22, Birmingham',
           '+44 121 555 0789',
+          'Unassigned',
         ],
       );
       db.run(
-        'INSERT INTO leads (id, name, company, email, value, source, createdAt, address, phone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO leads (id, name, company, email, value, source, createdAt, address, phone, ownerName) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [
           'lead-4',
           'Michael Chen',
@@ -463,12 +564,13 @@ function seedDemoData() {
           '2025-11-05T16:20:00.000Z',
           'Industrial Estate Road 5, Sheffield',
           '+44 114 555 0110',
+          'Unassigned',
         ],
       );
 
       // Deals
       db.run(
-        'INSERT INTO deals (id, leadId, title, stage, value, nextAction, nextActionDate, reminderChannel, aiAutoReminderEnabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO deals (id, leadId, title, stage, value, nextAction, nextActionDate, reminderChannel, aiAutoReminderEnabled, ownerName) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [
           'deal-1',
           'lead-1',
@@ -479,10 +581,11 @@ function seedDemoData() {
           '2025-12-03T10:00:00.000Z',
           'WhatsApp',
           1,
+          'Unassigned',
         ],
       );
       db.run(
-        'INSERT INTO deals (id, leadId, title, stage, value, nextAction, nextActionDate, reminderChannel, aiAutoReminderEnabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO deals (id, leadId, title, stage, value, nextAction, nextActionDate, reminderChannel, aiAutoReminderEnabled, ownerName) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [
           'deal-2',
           'lead-2',
@@ -493,10 +596,11 @@ function seedDemoData() {
           '2025-12-02T09:30:00.000Z',
           'SMS',
           0,
+          'Unassigned',
         ],
       );
       db.run(
-        'INSERT INTO deals (id, leadId, title, stage, value, nextAction, nextActionDate, reminderChannel, aiAutoReminderEnabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO deals (id, leadId, title, stage, value, nextAction, nextActionDate, reminderChannel, aiAutoReminderEnabled, ownerName) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [
           'deal-3',
           'lead-3',
@@ -507,10 +611,11 @@ function seedDemoData() {
           '2025-12-05T15:00:00.000Z',
           'WhatsApp',
           1,
+          'Unassigned',
         ],
       );
       db.run(
-        'INSERT INTO deals (id, leadId, title, stage, value, nextAction, nextActionDate, reminderChannel, aiAutoReminderEnabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO deals (id, leadId, title, stage, value, nextAction, nextActionDate, reminderChannel, aiAutoReminderEnabled, ownerName) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [
           'deal-4',
           'lead-4',
@@ -521,6 +626,7 @@ function seedDemoData() {
           '2025-12-04T11:00:00.000Z',
           'SMS',
           0,
+          'Unassigned',
         ],
       );
     });
@@ -534,7 +640,8 @@ function getDealWithLead(dealId, callback) {
       d.*,
       l.name AS leadName,
       l.company AS leadCompany,
-      l.email AS leadEmail
+      l.email AS leadEmail,
+      l.ownerName AS leadOwnerName
     FROM deals d
     LEFT JOIN leads l ON l.id = d.leadId
     WHERE d.id = ?
@@ -557,6 +664,7 @@ function getDealsWithLeadAndLastActivity(callback) {
       l.name AS leadName,
       l.company AS leadCompany,
       l.email AS leadEmail,
+      l.ownerName AS leadOwnerName,
       la.type AS lastActivityType,
       la.createdAt AS lastActivityDate
     FROM deals d
@@ -701,6 +809,7 @@ function getDealContextForMessageDraft(dealId, callback) {
       d.value AS valueGBP,
       d.nextAction,
       d.nextActionDate,
+      d.ownerName AS dealOwnerName,
       l.name AS leadName,
       l.company,
       l.email,
@@ -750,6 +859,8 @@ function getDealContextForMessageDraft(dealId, callback) {
             lastActivityType: activity ? activity.type : null,
             lastActivityDate: activity ? activity.createdAt : null,
             lastActivityNotes: activity ? activity.note : null,
+            dealOwnerName: row.dealOwnerName || 'Unassigned',
+            leadOwnerName: row.leadOwnerName || 'Unassigned',
           };
 
           return callback(null, context);
@@ -765,6 +876,7 @@ module.exports = {
   DB_PATH,
   createLead,
   getDealWithLead,
+  getLeads,
   createActivity,
   getActivitiesForDeal,
   updateDealStage,
