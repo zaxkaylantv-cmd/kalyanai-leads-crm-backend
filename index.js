@@ -13,6 +13,8 @@ const {
   getActivitiesForDeal,
   updateDealStage,
   createDeal,
+  updateDealDetails,
+  deleteLeadAndRelated,
 } = require('./db');
 
 const app = express();
@@ -102,6 +104,42 @@ app.post('/deals', (req, res) => {
   });
 });
 
+app.post('/deals/:dealId/details', (req, res) => {
+  const { dealId } = req.params;
+  const { value, nextAction, nextActionDate } = req.body || {};
+
+  const details = {};
+
+  if (typeof value === 'number') {
+    details.value = value;
+  }
+
+  if (typeof nextAction === 'string') {
+    details.nextAction = nextAction.trim();
+  }
+
+  if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'nextActionDate')) {
+    details.nextActionDate = nextActionDate || null;
+  }
+
+  if (Object.keys(details).length === 0) {
+    return res.status(400).json({ error: 'At least one of value, nextAction, or nextActionDate is required' });
+  }
+
+  updateDealDetails(dealId, details, (err, updatedDeal) => {
+    if (err) {
+      console.error('Failed to update deal details', err);
+      return res.status(500).json({ error: 'Failed to update deal details' });
+    }
+
+    if (!updatedDeal) {
+      return res.status(404).json({ error: 'Deal not found' });
+    }
+
+    return res.status(200).json(updatedDeal);
+  });
+});
+
 app.get('/deals/:dealId/activities', (req, res) => {
   const { dealId } = req.params;
   getActivitiesForDeal(dealId, (err, rows) => {
@@ -136,6 +174,23 @@ app.post('/deals/:dealId/activities', (req, res) => {
       return res.status(500).json({ error: 'Failed to create activity' });
     }
     res.status(201).json(activity);
+  });
+});
+
+app.delete('/leads/:leadId', (req, res) => {
+  const { leadId } = req.params;
+
+  deleteLeadAndRelated(leadId, (err, result) => {
+    if (err) {
+      console.error('Failed to delete lead and related data', err);
+      return res.status(500).json({ error: 'Failed to delete lead' });
+    }
+
+    if (result && result.notFound) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+
+    return res.status(200).json({ success: true });
   });
 });
 

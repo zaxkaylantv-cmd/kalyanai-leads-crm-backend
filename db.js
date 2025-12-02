@@ -234,6 +234,132 @@ function createDeal(deal, callback) {
   );
 }
 
+function updateDealDetails(dealId, details, callback) {
+  const fields = [];
+  const params = [];
+
+  if (typeof details.value === 'number') {
+    fields.push('value = ?');
+    params.push(details.value);
+  }
+
+  if (typeof details.nextAction === 'string') {
+    fields.push('nextAction = ?');
+    params.push(details.nextAction);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(details, 'nextActionDate')) {
+    fields.push('nextActionDate = ?');
+    params.push(details.nextActionDate);
+  }
+
+  if (fields.length === 0) {
+    return callback(new Error('No fields to update'));
+  }
+
+  params.push(dealId);
+
+  db.run(
+    `
+    UPDATE deals
+    SET ${fields.join(', ')}
+    WHERE id = ?
+    `,
+    params,
+    function (err) {
+      if (err) {
+        console.error('Error updating deal details:', err);
+        return callback(err);
+      }
+
+      db.get(
+        `
+        SELECT *
+        FROM deals
+        WHERE id = ?
+        `,
+        [dealId],
+        (getErr, row) => {
+          if (getErr) {
+            console.error('Error loading updated deal details:', getErr);
+            return callback(getErr);
+          }
+          callback(null, row || null);
+        },
+      );
+    },
+  );
+}
+
+function deleteLeadAndRelated(leadId, callback) {
+  db.all(
+    `
+    SELECT id FROM deals WHERE leadId = ?
+    `,
+    [leadId],
+    (err, dealRows) => {
+      if (err) {
+        console.error('Error loading deals for lead:', err);
+        return callback(err);
+      }
+
+      const dealIds = dealRows.map((row) => row.id);
+
+      db.serialize(() => {
+        if (dealIds.length > 0) {
+          const placeholders = dealIds.map(() => '?').join(', ');
+          db.run(
+            `
+            DELETE FROM activities
+            WHERE dealId IN (${placeholders})
+            `,
+            dealIds,
+            (actErr) => {
+              if (actErr) {
+                console.error('Error deleting activities for lead:', actErr);
+              }
+            },
+          );
+        }
+
+        db.run(
+          `
+          DELETE FROM deals
+          WHERE leadId = ?
+          `,
+          [leadId],
+          (dealErr) => {
+            if (dealErr) {
+              console.error('Error deleting deals for lead:', dealErr);
+              return callback(dealErr);
+            }
+
+            db.run(
+              `
+              DELETE FROM leads
+              WHERE id = ?
+              `,
+              [leadId],
+              function (leadErr) {
+                if (leadErr) {
+                  console.error('Error deleting lead:', leadErr);
+                  return callback(leadErr);
+                }
+
+                if (this.changes === 0) {
+                  return callback(null, { notFound: true });
+                }
+
+                callback(null, { notFound: false });
+              },
+            );
+          },
+        );
+      });
+    },
+  );
+}
+
 function seedDemoData() {
   db.get('SELECT COUNT(*) AS count FROM leads', (err, row) => {
     if (err) {
@@ -397,4 +523,6 @@ module.exports = {
   getActivitiesForDeal,
   updateDealStage,
   createDeal,
+  updateDealDetails,
+  deleteLeadAndRelated,
 };
