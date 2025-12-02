@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
+const { v4: uuidv4 } = require('uuid');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_PATH = path.join(DATA_DIR, 'leads-crm.sqlite');
@@ -42,6 +43,23 @@ function initialiseDb() {
       )`,
     );
 
+    db.run(
+      `CREATE TABLE IF NOT EXISTS activities (
+        id TEXT PRIMARY KEY,
+        dealId TEXT NOT NULL,
+        type TEXT NOT NULL,
+        note TEXT NOT NULL,
+        createdAt TEXT NOT NULL
+      )`,
+      (err) => {
+        if (err) {
+          console.error('Error creating activities table:', err);
+        } else {
+          console.log('Activities table ready');
+        }
+      },
+    );
+
     seedDemoData();
   });
 }
@@ -80,6 +98,138 @@ function createLead(lead, callback) {
         return callback(err);
       }
       callback(null);
+    },
+  );
+}
+
+function createActivity(activity, callback) {
+  const { id, dealId, type, note, createdAt } = activity;
+  db.run(
+    `
+    INSERT INTO activities (id, dealId, type, note, createdAt)
+    VALUES (?, ?, ?, ?, ?)
+    `,
+    [id, dealId, type, note, createdAt],
+    (err) => {
+      if (err) {
+        console.error('Error inserting activity:', err);
+        return callback(err);
+      }
+      callback(null);
+    },
+  );
+}
+
+function getActivitiesForDeal(dealId, callback) {
+  db.all(
+    `
+    SELECT * FROM activities
+    WHERE dealId = ?
+    ORDER BY datetime(createdAt) DESC
+    `,
+    [dealId],
+    (err, rows) => {
+      if (err) {
+        console.error('Error fetching activities:', err);
+        return callback(err);
+      }
+      callback(null, rows);
+    },
+  );
+}
+
+function updateDealStage(dealId, stage, callback) {
+  db.run(
+    `
+    UPDATE deals
+    SET stage = ?
+    WHERE id = ?
+    `,
+    [stage, dealId],
+    function (err) {
+      if (err) {
+        console.error('Error updating deal stage:', err);
+        return callback(err);
+      }
+
+      db.get(
+        `
+        SELECT *
+        FROM deals
+        WHERE id = ?
+        `,
+        [dealId],
+        (getErr, row) => {
+          if (getErr) {
+            console.error('Error loading updated deal:', getErr);
+            return callback(getErr);
+          }
+          callback(null, row || null);
+        },
+      );
+    },
+  );
+}
+
+function createDeal(deal, callback) {
+  const id = deal.id || uuidv4();
+  const {
+    leadId,
+    title,
+    stage = 'New',
+    value = 0,
+    nextAction = null,
+    nextActionDate = null,
+    reminderChannel = null,
+    aiAutoReminderEnabled = 0,
+  } = deal;
+
+  db.run(
+    `
+    INSERT INTO deals (
+      id,
+      leadId,
+      title,
+      stage,
+      value,
+      nextAction,
+      nextActionDate,
+      reminderChannel,
+      aiAutoReminderEnabled
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+    [
+      id,
+      leadId,
+      title,
+      stage,
+      value,
+      nextAction,
+      nextActionDate,
+      reminderChannel,
+      aiAutoReminderEnabled ? 1 : 0,
+    ],
+    function (err) {
+      if (err) {
+        console.error('Error creating deal:', err);
+        return callback(err);
+      }
+
+      db.get(
+        `
+        SELECT *
+        FROM deals
+        WHERE id = ?
+        `,
+        [id],
+        (getErr, row) => {
+          if (getErr) {
+            console.error('Error fetching created deal:', getErr);
+            return callback(getErr);
+          }
+          callback(null, row || null);
+        },
+      );
     },
   );
 }
@@ -237,4 +387,14 @@ function getDealWithLead(dealId, callback) {
   );
 }
 
-module.exports = { db, initialiseDb, DB_PATH, createLead, getDealWithLead };
+module.exports = {
+  db,
+  initialiseDb,
+  DB_PATH,
+  createLead,
+  getDealWithLead,
+  createActivity,
+  getActivitiesForDeal,
+  updateDealStage,
+  createDeal,
+};

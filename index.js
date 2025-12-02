@@ -4,7 +4,16 @@ require('dotenv').config();
 const OpenAI = require('openai');
 
 const { v4: uuidv4 } = require('uuid');
-const { db, initialiseDb, createLead, getDealWithLead } = require('./db');
+const {
+  db,
+  initialiseDb,
+  createLead,
+  getDealWithLead,
+  createActivity,
+  getActivitiesForDeal,
+  updateDealStage,
+  createDeal,
+} = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 3003;
@@ -46,6 +55,122 @@ app.get('/deals', (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch deals' });
     }
     res.json(rows);
+  });
+});
+
+app.post('/deals', (req, res) => {
+  const {
+    leadId,
+    title,
+    value,
+    stage,
+    nextAction,
+    nextActionDate,
+    reminderChannel,
+    aiAutoReminderEnabled,
+  } = req.body || {};
+
+  if (!leadId || typeof leadId !== 'string' || !leadId.trim()) {
+    return res.status(400).json({ error: 'leadId is required' });
+  }
+  if (!title || typeof title !== 'string' || !title.trim()) {
+    return res.status(400).json({ error: 'title is required' });
+  }
+
+  const dealInput = {
+    leadId: leadId.trim(),
+    title: title.trim(),
+    stage: stage && typeof stage === 'string' ? stage : 'New',
+    value: typeof value === 'number' ? value : 0,
+    nextAction: typeof nextAction === 'string' ? nextAction.trim() : null,
+    nextActionDate: nextActionDate || null,
+    reminderChannel: typeof reminderChannel === 'string' ? reminderChannel.trim() : null,
+    aiAutoReminderEnabled: !!aiAutoReminderEnabled,
+  };
+
+  createDeal(dealInput, (err, createdDeal) => {
+    if (err) {
+      console.error('Failed to create deal', err);
+      return res.status(500).json({ error: 'Failed to create deal' });
+    }
+
+    if (!createdDeal) {
+      return res.status(500).json({ error: 'Deal not created' });
+    }
+
+    return res.status(201).json(createdDeal);
+  });
+});
+
+app.get('/deals/:dealId/activities', (req, res) => {
+  const { dealId } = req.params;
+  getActivitiesForDeal(dealId, (err, rows) => {
+    if (err) {
+      console.error('Error fetching activities:', err);
+      return res.status(500).json({ error: 'Failed to fetch activities' });
+    }
+    res.json(rows);
+  });
+});
+
+app.post('/deals/:dealId/activities', (req, res) => {
+  const { dealId } = req.params;
+  const { type, note, createdAt } = req.body || {};
+
+  if (!type || !note) {
+    return res.status(400).json({ error: 'type and note are required' });
+  }
+
+  const id = uuidv4();
+  const activity = {
+    id,
+    dealId,
+    type,
+    note,
+    createdAt: createdAt || new Date().toISOString(),
+  };
+
+  createActivity(activity, (err) => {
+    if (err) {
+      console.error('Error inserting activity:', err);
+      return res.status(500).json({ error: 'Failed to create activity' });
+    }
+    res.status(201).json(activity);
+  });
+});
+
+app.post('/deals/:dealId/stage', (req, res) => {
+  const { dealId } = req.params;
+  const { stage } = req.body || {};
+
+  if (!stage || typeof stage !== 'string' || !stage.trim()) {
+    return res.status(400).json({ error: 'stage is required' });
+  }
+
+  updateDealStage(dealId, stage.trim(), (err, updatedDeal) => {
+    if (err) {
+      console.error('Failed to update deal stage', err);
+      return res.status(500).json({ error: 'Failed to update deal stage' });
+    }
+
+    if (!updatedDeal) {
+      return res.status(404).json({ error: 'Deal not found' });
+    }
+
+    const activity = {
+      id: uuidv4(),
+      dealId,
+      type: 'status_change',
+      note: `Status updated to ${updatedDeal.stage}`,
+      createdAt: new Date().toISOString(),
+    };
+
+    createActivity(activity, (activityErr) => {
+      if (activityErr) {
+        console.error('Failed to record status change activity', activityErr);
+      }
+      return res.status(200).json(updatedDeal);
+    });
   });
 });
 
@@ -161,6 +286,203 @@ Next action due date: ${nextActionDate || 'not specified'}
   });
 });
 
+app.post('/ai/deal-recovery', (req, res) => {
+  const { dealId, userNotes } = req.body || {};
+
+  if (!dealId) {
+    return res.status(400).json({ error: 'dealId is required' });
+  }
+
+  getDealWithLead(dealId, (dealErr, deal) => {
+    if (dealErr) {
+      console.error('Error fetching deal for recovery:', dealErr);
+      return res.status(500).json({ error: 'Failed to fetch deal' });
+    }
+
+    if (!deal) {
+      return res.status(404).json({ error: 'Deal not found' });
+    }
+
+    getActivitiesForDeal(dealId, async (activitiesErr, activityRows) => {
+      if (activitiesErr) {
+        console.error('Error fetching activities for recovery:', activitiesErr);
+      }
+
+      const activities = activityRows || [];
+
+      const context = {
+        deal: {
+          id: deal.id,
+          title: deal.title,
+          stage: deal.stage,
+          value: deal.value,
+          nextAction: deal.nextAction,
+          nextActionDate: deal.nextActionDate,
+        },
+        lead: {
+          name: deal.leadName,
+          company: deal.leadCompany,
+          email: deal.leadEmail,
+        },
+        activities: activities.map((a) => ({
+          type: a.type,
+          note: a.note,
+          createdAt: a.createdAt,
+        })),
+        userNotes: userNotes || null,
+      };
+
+      let reasonSummary;
+      if (userNotes && typeof userNotes === 'string' && userNotes.trim()) {
+        reasonSummary = `Based on your notes, this situation looks like: ${userNotes.trim()}`;
+      } else {
+        switch (deal.stage) {
+          case 'Lost':
+            reasonSummary =
+              'This deal appears to be stalled or marked as Lost. Common reasons include price, timing, or misalignment with the client\'s priorities.';
+            break;
+          case 'New':
+            reasonSummary =
+              'This is a new lead. The main risk is lack of clarity on fit, priorities, and decision-makers.';
+            break;
+          case 'Qualified':
+            reasonSummary =
+              'This is a qualified opportunity. The main risks are unclear budget, timing, and unspoken objections.';
+            break;
+          case 'Proposal Sent':
+            reasonSummary =
+              'A proposal has been sent. The main risk is going quiet without addressing hidden concerns or decision dynamics.';
+            break;
+          case 'Won':
+            reasonSummary =
+              'This is a won deal. The main risk is poor onboarding or missed expansion opportunities.';
+            break;
+          default:
+            reasonSummary =
+              'This deal is in progress. The main risks are unclear next steps and unaddressed concerns.';
+            break;
+        }
+      }
+
+      let recoveryIdeas;
+      let messageTemplate;
+
+      switch (deal.stage) {
+        case 'Lost':
+          recoveryIdeas = [
+            'Send a short check-in asking if priorities have changed or if concerns remain.',
+            'Offer a lighter/pilot package to reduce risk and re-open the conversation.',
+            'Ask for permission to stay in touch with occasional, high-value insights.',
+          ];
+          messageTemplate =
+            'Hi {{CLIENT_NAME}},\n\nI know we haven’t moved ahead yet, but I wanted to check in briefly in case your priorities have shifted. If helpful, I can suggest a smaller, lower-risk way to test this with you and address any concerns.\n\nThanks,\n{{YOUR_NAME}}';
+          break;
+        case 'Won':
+          recoveryIdeas = [
+            'Confirm onboarding success criteria and timeline with clear owners.',
+            'Schedule a kickoff to align on quick wins and risk areas.',
+            'Identify expansion, referral, or upsell opportunities once early value is proven.',
+          ];
+          messageTemplate =
+            'Hi {{CLIENT_NAME}},\n\nExcited to get you live. Can we confirm your success criteria and timeline, and schedule a quick kickoff to align owners? I can also share a plan for early wins and discuss potential expansion paths once we deliver them.\n\nThanks,\n{{YOUR_NAME}}';
+          break;
+        case 'Proposal Sent':
+          recoveryIdeas = [
+            'Follow up with a concise summary of value, pricing, and next steps.',
+            'Surface hidden concerns by asking about decision-makers and timeline.',
+            'Offer a short call to address objections and agree a decision date.',
+          ];
+          messageTemplate =
+            'Hi {{CLIENT_NAME}},\n\nFollowing our proposal, I want to ensure we’ve addressed all questions. Are there any concerns from your side or other decision-makers? If helpful, I can walk through the key points briefly and align on a decision date.\n\nThanks,\n{{YOUR_NAME}}';
+          break;
+        case 'New':
+        case 'Qualified':
+          recoveryIdeas = [
+            'Clarify the problem, urgency, and success criteria with the client.',
+            'Confirm budget, timeline, and the decision-making process.',
+            'Propose a small next step (demo, pilot, or workshop) to de-risk.',
+          ];
+          messageTemplate =
+            'Hi {{CLIENT_NAME}},\n\nThanks for the recent conversation. To make this valuable, could we confirm your top priorities, timing, and decision process? I can suggest a focused next step (demo, pilot, or workshop) to de-risk and show quick value.\n\nThanks,\n{{YOUR_NAME}}';
+          break;
+        default:
+          recoveryIdeas = [
+            'Clarify the client’s current priorities and any blockers.',
+            'Confirm decision process, timeline, and remaining questions.',
+            'Propose a clear next step to keep momentum (short call, demo, or pilot).',
+          ];
+          messageTemplate =
+            'Hi {{CLIENT_NAME}},\n\nChecking in to make sure we’re aligned on priorities and next steps. Are there any open questions or blockers? I can propose a short call to confirm the plan and keep things moving.\n\nThanks,\n{{YOUR_NAME}}';
+          break;
+      }
+
+      const stub = {
+        dealId,
+        reasonSummary,
+        recoveryIdeas,
+        messageTemplate,
+        source: 'stub',
+      };
+
+      if (!process.env.OPENAI_API_KEY) {
+        return res.status(200).json(stub);
+      }
+
+      try {
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-4.1-mini',
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content:
+                'You are a sales coach helping with deals at any stage. Always respond in JSON.',
+            },
+            {
+              role: 'user',
+              content: JSON.stringify({
+                task: 'analyse_deal',
+                instructions:
+                  'You are a sales coach. Use the CURRENT stage as the source of truth. If stage is "Lost", focus on why it was lost and how to revive/re-open. If stage is "New" or "Qualified", treat it as an active opportunity and focus on clarifying fit, priorities, and next steps. If stage is "Proposal Sent", focus on closing, handling objections, and follow-up strategy. If stage is "Won", focus on onboarding, expansion, and strengthening the relationship. NEVER describe the deal as lost unless the stage is exactly "Lost". Use the rep\'s notes and activity history to make advice concrete. Respond in JSON with keys reasonSummary, recoveryIdeas (array of short bullet-style strings), and messageTemplate (a concise outreach email or message). Use GBP / £ if you reference amounts.',
+                context,
+              }),
+            },
+          ],
+          max_tokens: 400,
+        });
+
+        const content = completion.choices?.[0]?.message?.content;
+        let parsed;
+        try {
+          parsed = JSON.parse(content || '{}');
+        } catch (parseErr) {
+          console.error('Failed to parse deal recovery AI response', parseErr, content);
+        }
+
+        if (
+          parsed &&
+          typeof parsed.reasonSummary === 'string' &&
+          Array.isArray(parsed.recoveryIdeas) &&
+          typeof parsed.messageTemplate === 'string'
+        ) {
+          return res.status(200).json({
+            dealId,
+            reasonSummary: parsed.reasonSummary,
+            recoveryIdeas: parsed.recoveryIdeas,
+            messageTemplate: parsed.messageTemplate,
+            source: 'openai',
+          });
+        }
+
+        return res.status(200).json({ ...stub, source: 'fallback' });
+      } catch (aiErr) {
+        console.error('Error from OpenAI for deal recovery:', aiErr);
+        return res.status(200).json({ ...stub, source: 'fallback' });
+      }
+    });
+  });
+});
+
 app.post('/ai/reminder-text', (req, res) => {
   const { dealId, channel } = req.body || {};
   if (!dealId) {
@@ -245,6 +567,124 @@ Channel: ${channel}
       });
     }
   });
+});
+
+app.get('/ai/pipeline-insights', (req, res) => {
+  db.all(
+    `
+    SELECT
+      d.*,
+      l.name AS leadName,
+      l.company AS leadCompany
+    FROM deals d
+    LEFT JOIN leads l ON l.id = d.leadId
+    `,
+    [],
+    async (err, rows) => {
+      if (err) {
+        console.error('Error loading pipeline data:', err);
+        return res.status(500).json({ error: 'Failed to load pipeline data' });
+      }
+
+      const deals = rows || [];
+      const totalDeals = deals.length;
+      const totalValue = deals.reduce(
+        (sum, d) => sum + (Number.isFinite(d.value) ? Number(d.value) : 0),
+        0,
+      );
+      const valueByStage = deals.reduce((acc, d) => {
+        const stage = d.stage || 'Unknown';
+        const v = Number.isFinite(d.value) ? Number(d.value) : 0;
+        acc[stage] = (acc[stage] || 0) + v;
+        return acc;
+      }, {});
+
+      const meta = {
+        totalDeals,
+        totalValue,
+        valueByStage,
+        generatedAt: new Date().toISOString(),
+      };
+      const formattedTotalValue = totalValue.toLocaleString('en-GB', {
+        style: 'currency',
+        currency: 'GBP',
+      });
+
+      const topStage =
+        Object.keys(valueByStage).length === 0
+          ? 'N/A'
+          : Object.entries(valueByStage).sort((a, b) => b[1] - a[1])[0][0];
+
+      const stub = {
+        snapshot: `You have ${totalDeals} deals with total pipeline value of ${formattedTotalValue}. Top stage by value is ${topStage}.`,
+        coaching:
+          `Focus on the higher-value deals in ${topStage} and keep momentum; clear out stalled, low-value items so the team can concentrate on the best opportunities.`,
+        source: 'stub',
+        meta,
+      };
+
+      if (!process.env.OPENAI_API_KEY) {
+        return res.json(stub);
+      }
+
+      try {
+        const compactDeals = deals
+          .map(
+            (d) =>
+              `• ${d.id}: ${d.title || 'Untitled'} | stage=${d.stage || 'unknown'} | value=£${d.value ?? 0} | lead=${d.leadName || 'unknown'} @ ${d.leadCompany || 'unknown'}`,
+          )
+          .join('\n');
+
+        const systemPrompt =
+          'You are a concise revenue coach. Given pipeline stats and a compact deal list, return STRICT JSON with keys "snapshot" and "coaching" only. Keep each value to 2-3 sentences. Be specific and action-oriented. All amounts are in GBP (British Pounds); use the £ symbol.';
+
+        const userContext = `
+Pipeline stats:
+- totalDeals: ${totalDeals}
+- totalValue (GBP): ${formattedTotalValue}
+- valueByStage: ${JSON.stringify(valueByStage)}
+
+Deals:
+${compactDeals}
+`;
+
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-4.1-mini',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userContext },
+          ],
+          response_format: { type: 'json_object' },
+          max_tokens: 220,
+        });
+
+        const content = completion.choices?.[0]?.message?.content;
+        let parsed;
+        try {
+          parsed = content ? JSON.parse(content) : null;
+        } catch (parseErr) {
+          throw parseErr;
+        }
+
+        if (!parsed || typeof parsed.snapshot !== 'string' || typeof parsed.coaching !== 'string') {
+          throw new Error('Invalid AI response format');
+        }
+
+        return res.json({
+          snapshot: parsed.snapshot,
+          coaching: parsed.coaching,
+          source: 'openai',
+          meta,
+        });
+      } catch (aiErr) {
+        console.error('Error from OpenAI for pipeline-insights:', aiErr);
+        return res.json({
+          ...stub,
+          source: 'fallback',
+        });
+      }
+    },
+  );
 });
 
 app.listen(PORT, () => {
