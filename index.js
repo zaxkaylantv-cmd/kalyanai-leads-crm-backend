@@ -17,6 +17,10 @@ const {
   deleteLeadAndRelated,
   getDealsWithLeadAndLastActivity,
   getDealContextForMessageDraft,
+  getRecentActivitiesForDeal,
+  getOutreachStepsForDeal,
+  createOutreachSteps,
+  updateOutreachStepStatus,
 } = require('./db');
 
 const app = express();
@@ -153,6 +157,23 @@ app.get('/deals/:dealId/activities', (req, res) => {
   });
 });
 
+app.get('/deals/:dealId/outreach-steps', (req, res) => {
+  const { dealId } = req.params;
+
+  if (!dealId) {
+    return res.status(400).json({ error: 'dealId is required' });
+  }
+
+  getOutreachStepsForDeal(dealId, (err, steps) => {
+    if (err) {
+      console.error('Failed to fetch outreach steps', err);
+      return res.status(500).json({ error: 'Failed to fetch outreach steps' });
+    }
+
+    return res.json(steps);
+  });
+});
+
 app.post('/deals/:dealId/activities', (req, res) => {
   const { dealId } = req.params;
   const { type, note, createdAt } = req.body || {};
@@ -176,6 +197,294 @@ app.post('/deals/:dealId/activities', (req, res) => {
       return res.status(500).json({ error: 'Failed to create activity' });
     }
     res.status(201).json(activity);
+  });
+});
+
+app.patch('/outreach-steps/:stepId/status', (req, res) => {
+  const { stepId } = req.params;
+  const { status } = req.body || {};
+
+  const allowedStatuses = ['pending', 'done', 'skipped'];
+  if (!stepId || !allowedStatuses.includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+
+  updateOutreachStepStatus(stepId, status, (err, result) => {
+    if (err) {
+      console.error('Failed to update outreach step status', err);
+      return res.status(500).json({ error: 'Failed to update outreach step status' });
+    }
+
+    if (result && result.notFound) {
+      return res.status(404).json({ error: 'Outreach step not found' });
+    }
+
+    return res.status(200).json({ ok: true, status });
+  });
+});
+
+function normalizeIntentForStage(stage, originalIntent, hasAnyContact) {
+  if (!originalIntent) return 'nurture_checkin';
+
+  const intent = String(originalIntent).toLowerCase();
+  const stageLower = stage ? String(stage).toLowerCase() : '';
+
+  if (intent === 'first_contact') {
+    if (stageLower === 'new') {
+      return 'first_contact';
+    }
+
+    if (stageLower === 'qualified') {
+      return 'nurture_checkin';
+    }
+
+    if (stageLower === 'proposal sent' || stageLower === 'proposal_sent') {
+      return 'proposal_followup';
+    }
+
+    if (stageLower === 'won') {
+      return 'post_call_summary';
+    }
+
+    if (stageLower === 'lost') {
+      return 'deal_recovery';
+    }
+
+    if (hasAnyContact) {
+      return 'nurture_checkin';
+    }
+  }
+
+  const allowedIntents = new Set([
+    'first_contact',
+    'post_call_summary',
+    'proposal_followup',
+    'nurture_checkin',
+    'deal_recovery',
+    'meeting_confirmation',
+    'meeting_reminder',
+    'invoice_gentle',
+    'invoice_firm',
+    'invoice_final',
+  ]);
+
+  if (allowedIntents.has(intent)) {
+    return intent;
+  }
+
+  return 'nurture_checkin';
+}
+
+app.post('/ai/outreach-plan', (req, res) => {
+  const { dealId, horizonDays } = req.body || {};
+
+  if (!dealId) {
+    return res.status(400).json({ error: 'dealId is required' });
+  }
+
+  const parsedHorizon = Number.isInteger(horizonDays) && horizonDays > 0 ? horizonDays : 14;
+  const allowedChannels = ['email', 'whatsapp', 'sms', 'call_script'];
+  const allowedIntents = [
+    'first_contact',
+    'post_call_summary',
+    'proposal_followup',
+    'nurture_checkin',
+    'deal_recovery',
+    'meeting_confirmation',
+    'meeting_reminder',
+    'invoice_gentle',
+    'invoice_firm',
+    'invoice_final',
+  ];
+
+  getDealContextForMessageDraft(dealId, async (err, context) => {
+    if (err) {
+      console.error('Error fetching deal for outreach plan:', err);
+      return res.status(500).json({ error: 'Failed to generate outreach plan' });
+    }
+
+    if (!context) {
+      return res.status(404).json({ error: 'Deal not found' });
+    }
+
+    getRecentActivitiesForDeal(dealId, 5, async (activitiesErr, activityRows) => {
+      if (activitiesErr) {
+        console.error('Error fetching recent activities for outreach plan:', activitiesErr);
+      }
+
+      const recentActivities = (activityRows || []).map((row) => ({
+        type: row.type || null,
+        createdAt: row.createdAt || null,
+        note: row.note || null,
+      }));
+
+      const input = {
+        appName: 'lead_desk',
+        horizonDays: parsedHorizon,
+        deal: {
+          id: context.dealId || dealId,
+          stage: context.stage,
+          valueGBP: context.valueGBP || null,
+          name: context.dealName || null,
+        },
+        lead: {
+          name: context.leadName || null,
+          company: context.company || null,
+        },
+        recentHistory: {
+          lastContactType: context.lastActivityType || null,
+          lastContactDate: context.lastActivityDate || null,
+          recentActivities,
+        },
+      };
+      const hasAnyContact = !!context.lastActivityDate || recentActivities.length > 0;
+
+      async function buildAndStoreSteps(modelSteps) {
+        const today = new Date();
+        const stepsToInsert = [];
+
+        const normalizedSteps = (modelSteps || []).map((step) => {
+          const normalizedIntent = normalizeIntentForStage(
+            context.stage,
+            step.intent,
+            hasAnyContact,
+          );
+
+          return {
+            ...step,
+            intent: normalizedIntent,
+          };
+        });
+
+        normalizedSteps.forEach((step) => {
+          if (
+            typeof step !== 'object' ||
+            typeof step.offsetDays !== 'number' ||
+            step.offsetDays < 0 ||
+            step.offsetDays > parsedHorizon
+          ) {
+            return;
+          }
+
+          if (!allowedChannels.includes(step.channel) || !allowedIntents.includes(step.intent)) {
+            return;
+          }
+
+          const due = new Date(today);
+          due.setHours(9, 0, 0, 0);
+          due.setDate(due.getDate() + step.offsetDays);
+
+          stepsToInsert.push({
+            id: uuidv4(),
+            dealId,
+            dueDate: due.toISOString(),
+            channel: step.channel,
+            intent: step.intent,
+            goal: step.goal || null,
+            status: 'pending',
+          });
+        });
+
+        if (stepsToInsert.length === 0) {
+          return null;
+        }
+
+        return new Promise((resolve, reject) => {
+          createOutreachSteps(stepsToInsert, (createErr) => {
+            if (createErr) {
+              return reject(createErr);
+            }
+
+            getOutreachStepsForDeal(dealId, (fetchErr, rows) => {
+              if (fetchErr) {
+                return reject(fetchErr);
+              }
+              resolve(rows || []);
+            });
+          });
+        });
+      }
+
+      async function handleStubResponse() {
+        const stub = [
+          {
+            offsetDays: 0,
+            channel: 'email',
+            intent: 'first_contact',
+            goal: 'Send a concise intro email with value props and propose a short call.',
+          },
+          {
+            offsetDays: 3,
+            channel: 'whatsapp',
+            intent: 'nurture_checkin',
+            goal: 'Lightly check in to see if they had a chance to review.',
+          },
+          {
+            offsetDays: 7,
+            channel: 'call_script',
+            intent: 'post_call_summary',
+            goal: 'Call to recap fit, address questions, and agree next steps.',
+          },
+        ];
+
+        return buildAndStoreSteps(stub);
+      }
+
+      if (!process.env.OPENAI_API_KEY) {
+        return handleStubResponse()
+          .then((rows) => res.status(200).json({ dealId, steps: rows || [] }))
+          .catch((storeErr) => {
+            console.error('Failed to store stub outreach steps', storeErr);
+            res.status(500).json({ error: 'Failed to generate outreach plan' });
+          });
+      }
+
+      try {
+        const systemMessage =
+          'You are the Outreach Planner for Lead Desk. Plan 3-5 concrete outreach steps over the next horizonDays.' +
+          ' Use only channels: email, whatsapp, sms, call_script. Use intents from the provided list.' +
+          ' Provide short human-readable goals. Use GBP/£ if you mention amounts.' +
+          ' recentHistory.recentActivities is an array of recent events (type, createdAt, note) you can use to set tone.' +
+          ' Output ONLY valid JSON with a top-level "steps" array of objects: {offsetDays, channel, intent, goal}.' +
+          ' offsetDays must be between 0 and the provided horizonDays.';
+
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-4.1-mini',
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: systemMessage },
+            { role: 'user', content: JSON.stringify({ input }) },
+          ],
+        });
+
+        const content = completion.choices?.[0]?.message?.content || '{}';
+        let parsed;
+        try {
+          parsed = JSON.parse(content);
+        } catch (jsonErr) {
+          console.error('Failed to parse outreach plan JSON:', jsonErr);
+          parsed = null;
+        }
+
+        const created = await buildAndStoreSteps(parsed?.steps);
+
+        if (!created) {
+          console.warn('No outreach steps created from AI; using stub fallback');
+          const fallback = await handleStubResponse();
+          return res.status(200).json({ dealId, steps: fallback || [] });
+        }
+
+        return res.status(200).json({ dealId, steps: created });
+      } catch (aiErr) {
+        console.error('Error generating outreach plan:', aiErr);
+        return handleStubResponse()
+          .then((rows) => res.status(200).json({ dealId, steps: rows || [] }))
+          .catch((storeErr) => {
+            console.error('Failed to store fallback outreach steps', storeErr);
+            res.status(500).json({ error: 'Failed to generate outreach plan' });
+          });
+      }
+    });
   });
 });
 

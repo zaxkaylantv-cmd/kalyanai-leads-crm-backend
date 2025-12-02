@@ -44,6 +44,21 @@ function initialiseDb() {
     );
 
     db.run(
+      `CREATE TABLE IF NOT EXISTS outreach_steps (
+        id TEXT PRIMARY KEY,
+        dealId TEXT NOT NULL,
+        dueDate TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        intent TEXT NOT NULL,
+        goal TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+        completedAt TEXT,
+        FOREIGN KEY (dealId) REFERENCES deals(id) ON DELETE CASCADE
+      )`,
+    );
+
+    db.run(
       `CREATE TABLE IF NOT EXISTS activities (
         id TEXT PRIMARY KEY,
         dealId TEXT NOT NULL,
@@ -134,6 +149,27 @@ function getActivitiesForDeal(dealId, callback) {
         return callback(err);
       }
       callback(null, rows);
+    },
+  );
+}
+
+function getRecentActivitiesForDeal(dealId, limit, callback) {
+  const effectiveLimit = Number.isInteger(limit) && limit > 0 ? limit : 5;
+  db.all(
+    `
+    SELECT *
+    FROM activities
+    WHERE dealId = ?
+    ORDER BY datetime(createdAt) DESC
+    LIMIT ?
+    `,
+    [dealId, effectiveLimit],
+    (err, rows) => {
+      if (err) {
+        console.error('Error fetching recent activities:', err);
+        return callback(err);
+      }
+      callback(null, rows || []);
     },
   );
 }
@@ -545,6 +581,115 @@ function getDealsWithLeadAndLastActivity(callback) {
   );
 }
 
+function getOutreachStepsForDeal(dealId, callback) {
+  db.all(
+    `
+    SELECT *
+    FROM outreach_steps
+    WHERE dealId = ?
+    ORDER BY datetime(dueDate) ASC, datetime(createdAt) ASC
+    `,
+    [dealId],
+    (err, rows) => {
+      if (err) {
+        console.error('Error fetching outreach steps:', err);
+        return callback(err);
+      }
+      callback(null, rows || []);
+    },
+  );
+}
+
+function createOutreachSteps(steps, callback) {
+  if (!Array.isArray(steps) || steps.length === 0) {
+    return callback(null);
+  }
+
+  db.serialize(() => {
+    db.run('BEGIN TRANSACTION');
+    let hasErrored = false;
+    let remaining = steps.length;
+
+    steps.forEach((step) => {
+      if (hasErrored) {
+        return;
+      }
+
+      const statusValue = step.status || 'pending';
+      const completedAt = statusValue === 'pending' ? null : new Date().toISOString();
+      const id = step.id || uuidv4();
+
+      db.run(
+        `
+        INSERT INTO outreach_steps (
+          id,
+          dealId,
+          dueDate,
+          channel,
+          intent,
+          goal,
+          status,
+          completedAt
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          id,
+          step.dealId,
+          step.dueDate,
+          step.channel,
+          step.intent,
+          step.goal || null,
+          statusValue,
+          completedAt,
+        ],
+        (err) => {
+          if (err) {
+            hasErrored = true;
+            console.error('Error inserting outreach step:', err);
+            return db.run('ROLLBACK', () => callback(err));
+          }
+
+          remaining -= 1;
+          if (remaining === 0 && !hasErrored) {
+            db.run('COMMIT', (commitErr) => {
+              if (commitErr) {
+                console.error('Error committing outreach steps:', commitErr);
+                return callback(commitErr);
+              }
+              callback(null);
+            });
+          }
+        },
+      );
+    });
+  });
+}
+
+function updateOutreachStepStatus(stepId, status, callback) {
+  const completedAt = status === 'pending' ? null : new Date().toISOString();
+
+  db.run(
+    `
+    UPDATE outreach_steps
+    SET status = ?, completedAt = ?
+    WHERE id = ?
+    `,
+    [status, completedAt, stepId],
+    function (err) {
+      if (err) {
+        console.error('Error updating outreach step status:', err);
+        return callback(err);
+      }
+
+      if (this.changes === 0) {
+        return callback(null, { notFound: true });
+      }
+
+      callback(null, { notFound: false });
+    },
+  );
+}
+
 function getDealContextForMessageDraft(dealId, callback) {
   db.get(
     `
@@ -628,4 +773,8 @@ module.exports = {
   deleteLeadAndRelated,
   getDealsWithLeadAndLastActivity,
   getDealContextForMessageDraft,
+  getRecentActivitiesForDeal,
+  getOutreachStepsForDeal,
+  createOutreachSteps,
+  updateOutreachStepStatus,
 };
