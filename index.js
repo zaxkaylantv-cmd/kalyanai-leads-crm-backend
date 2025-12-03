@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 const OpenAI = require('openai');
+const nodemailer = require('nodemailer');
 
 const { v4: uuidv4 } = require('uuid');
 const {
@@ -22,7 +23,44 @@ const {
   getOutreachStepsForDeal,
   createOutreachSteps,
   updateOutreachStepStatus,
+  getPendingOutreachStepsDueToday,
+  updateLeadOwnerName,
+  updateDealsOwnerForLead,
+  getImportantRemindersForToday,
+  getReminderSettings,
+  saveReminderSettings,
 } = require('./db');
+
+const {
+  REMINDER_EMAIL_FROM,
+  REMINDER_EMAIL_TO,
+  SMTP_HOST,
+  SMTP_PORT,
+  SMTP_USER,
+  SMTP_PASS,
+} = process.env;
+
+let mailTransporter = null;
+
+function getMailTransporter() {
+  if (!mailTransporter) {
+    if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS) {
+      console.warn('SMTP is not fully configured; email sending is disabled.');
+      return null;
+    }
+
+    mailTransporter = nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: Number(SMTP_PORT),
+      secure: Number(SMTP_PORT) === 465,
+      auth: {
+        user: SMTP_USER,
+        pass: SMTP_PASS,
+      },
+    });
+  }
+  return mailTransporter;
+}
 
 const app = express();
 const PORT = process.env.PORT || 3003;
@@ -47,6 +85,206 @@ app.get('/health', (req, res) => {
   });
 });
 
+app.get('/reminders/today', async (req, res) => {
+  try {
+    const reminders = await getImportantRemindersForToday();
+    res.json({
+      date: new Date().toISOString(),
+      reminders,
+    });
+  } catch (err) {
+    console.error('Error in /reminders/today:', err);
+    res.status(500).json({ error: 'Failed to load reminders for today' });
+  }
+});
+
+function buildRemindersEmailPreview(reminders) {
+  const now = new Date();
+  const isoDate = now.toISOString();
+  const dateLabel = isoDate.slice(0, 10); // YYYY-MM-DD
+
+  const totalReminders = reminders.length;
+
+  const subject =
+    totalReminders === 0
+      ? `Lead Desk – ${dateLabel}: No urgent reminders`
+      : `Lead Desk – ${dateLabel}: ${totalReminders} urgent reminder${totalReminders === 1 ? '' : 's'}`;
+
+  if (totalReminders === 0) {
+    return {
+      date: isoDate,
+      totalReminders,
+      subject,
+      textBody: `Lead Desk – ${dateLabel}\n\nNo overdue or due-today reminders.\n`,
+    };
+  }
+
+  const groups = new Map();
+
+  for (const r of reminders) {
+    const ownerLabel = r.ownerName && r.ownerName.trim()
+      ? r.ownerName.trim()
+      : 'Unassigned owner';
+
+    if (!groups.has(ownerLabel)) {
+      groups.set(ownerLabel, []);
+    }
+    groups.get(ownerLabel).push(r);
+  }
+
+  const lines = [];
+  lines.push(`Lead Desk – ${dateLabel}`);
+  lines.push('');
+  lines.push('The following items are overdue or due today:');
+  lines.push('');
+
+  for (const [ownerLabel, ownerReminders] of groups.entries()) {
+    lines.push(`Owner: ${ownerLabel}`);
+    for (const r of ownerReminders) {
+      const urgencyTag = r.urgency === 'overdue' ? '[OVERDUE]' : '[TODAY]';
+      const leadPart = r.leadName ? ` | Lead: ${r.leadName}` : '';
+      const dealPart = r.dealTitle ? ` | Deal: ${r.dealTitle}` : '';
+      const datePart = r.dueDate ? ` | Due: ${r.dueDate}` : '';
+
+      if (r.type === 'nextAction') {
+        const actionText = r.nextAction || 'Next action';
+        lines.push(
+          `  ${urgencyTag} Next action: ${actionText}${leadPart}${dealPart}${datePart}`,
+        );
+      } else if (r.type === 'outreachStep') {
+        const channel = r.channel || 'channel';
+        const goal = r.goal || r.intent || 'Outreach step';
+        lines.push(
+          `  ${urgencyTag} Outreach via ${channel}: ${goal}${leadPart}${dealPart}${datePart}`,
+        );
+      } else {
+        lines.push(
+          `  ${urgencyTag} Reminder${leadPart}${dealPart}${datePart}`,
+        );
+      }
+    }
+    lines.push('');
+  }
+
+  const textBody = lines.join('\n');
+
+  return {
+    date: isoDate,
+    totalReminders,
+    subject,
+    textBody,
+  };
+}
+
+app.get('/reminders/today/email-preview', async (req, res) => {
+  try {
+    const reminders = await getImportantRemindersForToday();
+    const preview = buildRemindersEmailPreview(reminders || []);
+    res.json(preview);
+  } catch (err) {
+    console.error('Error in /reminders/today/email-preview:', err);
+    res.status(500).json({ error: 'Failed to build reminders email preview' });
+  }
+});
+
+app.get('/settings/reminders', async (req, res) => {
+  try {
+    const settings = await getReminderSettings();
+    res.json(settings);
+  } catch (err) {
+    console.error('Error in GET /settings/reminders:', err);
+    res.status(500).json({ error: 'Failed to load reminder settings' });
+  }
+});
+
+app.post('/settings/reminders', async (req, res) => {
+  try {
+    const { remindersEnabled, reminderChannel } = req.body || {};
+    const partial = {};
+
+    if (typeof remindersEnabled === 'boolean') {
+      partial.remindersEnabled = remindersEnabled;
+    }
+
+    if (typeof reminderChannel === 'string') {
+      const normalized = reminderChannel.toLowerCase();
+      if (['email', 'sms', 'whatsapp'].includes(normalized)) {
+        partial.reminderChannel = normalized;
+      }
+    }
+
+    const updated = await saveReminderSettings(partial);
+    res.json(updated);
+  } catch (err) {
+    console.error('Error in POST /settings/reminders:', err);
+    res.status(500).json({ error: 'Failed to update reminder settings' });
+  }
+});
+
+app.post('/reminders/today/send-email', async (req, res) => {
+  try {
+    const settings = await getReminderSettings();
+    if (!settings.remindersEnabled) {
+      return res.status(200).json({
+        sent: false,
+        reason: 'disabled',
+        message: 'Reminder email sending is currently disabled in settings',
+        settings,
+      });
+    }
+
+    const transporter = getMailTransporter();
+    if (!transporter) {
+      return res.status(500).json({
+        sent: false,
+        reason: 'smtp_not_configured',
+        error: 'SMTP is not configured; cannot send reminder emails',
+      });
+    }
+
+    if (!REMINDER_EMAIL_FROM || !REMINDER_EMAIL_TO) {
+      return res.status(500).json({
+        sent: false,
+        reason: 'email_from_to_missing',
+        error: 'REMINDER_EMAIL_FROM and REMINDER_EMAIL_TO must be configured',
+      });
+    }
+
+    const reminders = await getImportantRemindersForToday();
+    const preview = buildRemindersEmailPreview(reminders || []);
+
+    if (!preview.totalReminders || preview.totalReminders === 0) {
+      return res.status(200).json({
+        sent: false,
+        reason: 'no_reminders',
+        message: 'No overdue or due-today reminders; email not sent',
+        preview,
+      });
+    }
+
+    const mailOptions = {
+      from: REMINDER_EMAIL_FROM,
+      to: REMINDER_EMAIL_TO,
+      subject: preview.subject,
+      text: preview.textBody,
+    };
+
+    const info = await transporter.sendMail(mailOptions);
+
+    return res.status(200).json({
+      sent: true,
+      messageId: info.messageId,
+      envelope: info.envelope,
+      accepted: info.accepted,
+      rejected: info.rejected,
+      preview,
+    });
+  } catch (err) {
+    console.error('Error in /reminders/today/send-email:', err);
+    res.status(500).json({ error: 'Failed to send reminders email' });
+  }
+});
+
 app.get('/leads', (req, res) => {
   getLeads((err, rows) => {
     if (err) {
@@ -54,6 +292,33 @@ app.get('/leads', (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch leads' });
     }
     res.json(rows);
+  });
+});
+
+app.post('/leads/:leadId/owner', (req, res) => {
+  const { leadId } = req.params;
+  const { ownerName } = req.body || {};
+
+  if (!leadId) {
+    return res.status(400).json({ error: 'leadId is required' });
+  }
+
+  updateLeadOwnerName(leadId, ownerName, (leadErr, updatedLead) => {
+    if (leadErr) {
+      console.error('Error updating lead owner:', leadErr);
+      return res.status(500).json({ error: 'Failed to update lead owner' });
+    }
+
+    updateDealsOwnerForLead(leadId, ownerName, (dealErr) => {
+      if (dealErr) {
+        console.error('Error updating deals owner for lead:', dealErr);
+        return res
+          .status(500)
+          .json({ error: 'Lead owner updated, but failed for deals' });
+      }
+
+      return res.json(updatedLead);
+    });
   });
 });
 
@@ -226,36 +491,42 @@ app.patch('/outreach-steps/:stepId/status', (req, res) => {
   });
 });
 
+const DEFAULT_INTENT = 'nurture_checkin';
+
+function stageToBaseIntent(stage) {
+  const s = stage ? String(stage).toLowerCase() : '';
+  switch (s) {
+    case 'new':
+    case 'discovery booked':
+      return 'first_contact';
+    case 'qualified':
+    case 'presentation':
+      return 'nurture_checkin';
+    case 'proposal sent':
+    case 'proposal_sent':
+    case 'negotiation':
+      return 'proposal_followup';
+    case 'won':
+      return 'post_call_summary';
+    case 'lost':
+      return 'deal_recovery';
+    default:
+      return DEFAULT_INTENT;
+  }
+}
+
 function normalizeIntentForStage(stage, originalIntent, hasAnyContact) {
-  if (!originalIntent) return 'nurture_checkin';
+  const base = stageToBaseIntent(stage);
+  if (!originalIntent) return base;
 
   const intent = String(originalIntent).toLowerCase();
-  const stageLower = stage ? String(stage).toLowerCase() : '';
 
   if (intent === 'first_contact') {
-    if (stageLower === 'new') {
-      return 'first_contact';
-    }
-
-    if (stageLower === 'qualified') {
-      return 'nurture_checkin';
-    }
-
-    if (stageLower === 'proposal sent' || stageLower === 'proposal_sent') {
-      return 'proposal_followup';
-    }
-
-    if (stageLower === 'won') {
-      return 'post_call_summary';
-    }
-
-    if (stageLower === 'lost') {
-      return 'deal_recovery';
-    }
-
+    // If stage mapping prefers nurture based on prior contact
     if (hasAnyContact) {
       return 'nurture_checkin';
     }
+    return base;
   }
 
   const allowedIntents = new Set([
@@ -275,7 +546,7 @@ function normalizeIntentForStage(stage, originalIntent, hasAnyContact) {
     return intent;
   }
 
-  return 'nurture_checkin';
+  return base;
 }
 
 app.post('/ai/outreach-plan', (req, res) => {
@@ -970,11 +1241,12 @@ app.post('/ai/message-draft', (req, res) => {
       return res.status(404).json({ error: 'Deal not found' });
     }
 
+    const normalizedIntent = normalizeIntentForStage(context.stage, intent, !!context.lastActivityDate);
     const input = {
       appName: 'lead_desk',
       businessContext:
         'Kalyan AI builds custom AI and automation systems to save time, reduce errors and increase profitability for business owners.',
-      intent,
+      intent: normalizedIntent,
       channel,
       ownerName: (context.dealOwnerName && context.dealOwnerName.trim()) || 'Unassigned',
       senderName:
@@ -1094,11 +1366,83 @@ app.get('/ai/leads-summary', (req, res) => {
     }
 
     try {
+      const leads = await new Promise((resolve) => {
+        getLeads((leadErr, leadRows) => {
+          if (leadErr) {
+            console.error('Error fetching leads for outreach steps:', leadErr);
+            return resolve([]);
+          }
+          resolve(leadRows || []);
+        });
+      });
+
+      const leadsById = new Map(leads.map((l) => [l.id, l]));
+
+      const toDateKey = (d) => {
+        const year = d.getFullYear();
+        const month = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+      };
+
+      const todayKey = toDateKey(new Date());
+      const todaysOutreachSteps = [];
+
+      for (const deal of deals) {
+        const steps = await new Promise((resolve) => {
+          getOutreachStepsForDeal(deal.id, (stepErr, rows) => {
+            if (stepErr) {
+              console.error(`Error fetching outreach steps for deal ${deal.id}:`, stepErr);
+              return resolve([]);
+            }
+            resolve(rows || []);
+          });
+        });
+
+        if (!steps || steps.length === 0) continue;
+
+        const lead = leadsById.get(deal.leadId) || null;
+        const ownerName =
+          deal && typeof deal.ownerName === 'string' && deal.ownerName.trim()
+            ? deal.ownerName.trim()
+            : lead && typeof lead.ownerName === 'string' && lead.ownerName.trim()
+              ? lead.ownerName.trim()
+              : null;
+
+        const leadName =
+          lead && typeof lead.name === 'string' && lead.name.trim()
+            ? lead.name.trim()
+            : null;
+
+        for (const step of steps) {
+          if (!step || step.status !== 'pending') continue;
+
+          const stepDate = new Date(step.dueDate);
+          if (Number.isNaN(stepDate.getTime())) continue;
+
+          if (toDateKey(stepDate) !== todayKey) continue;
+
+          todaysOutreachSteps.push({
+            id: step.id,
+            dealId: step.dealId,
+            dueDate: step.dueDate,
+            channel: step.channel,
+            intent: step.intent,
+            goal: step.goal,
+            status: step.status,
+            ownerName,
+            leadName,
+            company: deal ? deal.leadCompany || null : null,
+            stage: deal ? deal.stage || null : null,
+          });
+        }
+      }
+
       const systemPrompt =
         'You are a concise sales coach creating a daily briefing for the Leads page. You MUST respond with a single valid JSON object only. No markdown, no commentary, no backticks.';
 
       const instructions =
-        'Assume today is provided. Prioritise: 1) deals with nextActionDate today or overdue, 2) higher-value Qualified/Proposal Sent with no recent contact, 3) New leads with no first contact. For each action item in todaysTopActions, overdueAtRisk, and newAndWarming, prefix the line with ownerName and a dash (e.g., "Zax Kalyan – Call Gemma about The Green Man (Proposal Sent, 3 days since last contact)."). Use ownerName from the input; if missing or Unassigned, use "Owner". For each topActions item include actionType (call/email/whatsapp/sms/meeting), why, and suggestedStep. Keep everything concise, skimmable, and use GBP (£). If little data, keep lists short and explain briefly. Respond ONLY with valid JSON (no trailing commas).';
+        'Assume today is provided. Prioritise: 1) deals with nextActionDate today or overdue, 2) higher-value Qualified/Proposal Sent with no recent contact, 3) New leads with no first contact. For each action item in todaysTopActions, overdueAtRisk, and newAndWarming, prefix the line with ownerName and a dash when an ownerName is present (e.g., "Zax Kalyan – Call Gemma about The Green Man (Proposal Sent, 3 days since last contact)."). If ownerName is missing or equals "Unassigned", do not add any name prefix; start the sentence directly. For each topActions item include actionType (call/email/whatsapp/sms/meeting), why, and suggestedStep. Keep everything concise, skimmable, and use GBP (£). If little data, keep lists short and explain briefly. Respond ONLY with valid JSON (no trailing commas).';
 
       const userPayload = {
         task: 'leads_daily_brief',
@@ -1133,8 +1477,40 @@ app.get('/ai/leads-summary', (req, res) => {
         throw new Error('Invalid AI response format');
       }
 
+      function cleanActionLines(list) {
+        if (!Array.isArray(list)) return [];
+        return list.filter((raw) => {
+          if (!raw) return false;
+          const line = String(raw).trim();
+          if (!line) return false;
+
+          const normalised = line.replace(/\s+/g, ' ').toLowerCase();
+          if (normalised === 'action - ( , )' || normalised === 'action – ( , )') {
+            return false;
+          }
+          if (
+            normalised.startsWith('action') &&
+            normalised.includes('(') &&
+            normalised.includes(')') &&
+            normalised.includes(',') &&
+            normalised.length < 40
+          ) {
+            return false;
+          }
+
+          if (normalised.length < 15) return false;
+
+          return true;
+        });
+      }
+
+      parsed.todaysTopActions = cleanActionLines(parsed.todaysTopActions);
+      parsed.overdueAtRisk = cleanActionLines(parsed.overdueAtRisk);
+      parsed.newAndWarming = cleanActionLines(parsed.newAndWarming);
+
       return res.json({
         ...parsed,
+        todaysOutreachSteps,
         source: 'openai:gpt-4.1-mini',
       });
     } catch (aiErr) {

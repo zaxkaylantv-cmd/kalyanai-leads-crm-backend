@@ -97,6 +97,13 @@ function initialiseDb() {
     );
 
     db.run(
+      `CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )`,
+    );
+
+    db.run(
       `CREATE TABLE IF NOT EXISTS outreach_steps (
         id TEXT PRIMARY KEY,
         dealId TEXT NOT NULL,
@@ -425,6 +432,61 @@ function updateDealDetails(dealId, details, callback) {
   );
 }
 
+function updateLeadOwnerName(leadId, ownerName, callback) {
+  const finalOwner = ownerName && ownerName.trim() ? ownerName.trim() : 'Unassigned';
+
+  db.run(
+    `
+    UPDATE leads
+    SET ownerName = ?
+    WHERE id = ?
+    `,
+    [finalOwner, leadId],
+    function (err) {
+      if (err) {
+        console.error('Error updating lead ownerName:', err);
+        return callback(err);
+      }
+
+      db.get(
+        `
+        SELECT id, name, company, email, value, source, createdAt, address, phone, ownerName
+        FROM leads
+        WHERE id = ?
+        `,
+        [leadId],
+        (getErr, row) => {
+          if (getErr) {
+            console.error('Error fetching updated lead owner:', getErr);
+            return callback(getErr);
+          }
+          callback(null, row || null);
+        },
+      );
+    },
+  );
+}
+
+function updateDealsOwnerForLead(leadId, ownerName, callback) {
+  const finalOwner = ownerName && ownerName.trim() ? ownerName.trim() : 'Unassigned';
+
+  db.run(
+    `
+    UPDATE deals
+    SET ownerName = ?
+    WHERE leadId = ?
+    `,
+    [finalOwner, leadId],
+    (err) => {
+      if (err) {
+        console.error('Error updating deals ownerName for lead:', err);
+        return callback(err);
+      }
+      callback(null);
+    },
+  );
+}
+
 function deleteLeadAndRelated(leadId, callback) {
   db.all(
     `
@@ -708,6 +770,162 @@ function getOutreachStepsForDeal(dealId, callback) {
   );
 }
 
+function getPendingOutreachStepsDueToday(callback) {
+  db.all(
+    `
+    SELECT
+      id,
+      dealId,
+      dueDate,
+      channel,
+      intent,
+      goal,
+      status
+    FROM outreach_steps
+    WHERE status = 'pending'
+      AND date(dueDate) = date('now')
+    `,
+    [],
+    (err, rows) => {
+      if (err) {
+        console.error('Error fetching pending outreach steps due today:', err);
+        return callback(err);
+      }
+      callback(null, rows || []);
+    },
+  );
+}
+
+async function getImportantRemindersForToday() {
+  const toDateKey = (d) => {
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  };
+
+  const todayKey = toDateKey(new Date());
+
+  const deals = await new Promise((resolve, reject) => {
+    getDealsWithLeadAndLastActivity((err, rows) => {
+      if (err) return reject(err);
+      resolve(rows || []);
+    });
+  });
+
+  const reminders = [];
+
+  for (const deal of deals) {
+    const dateStr = deal.nextActionDate;
+    if (dateStr) {
+      const date = new Date(dateStr);
+      if (!Number.isNaN(date.getTime())) {
+        const key = toDateKey(date);
+        let urgency = null;
+        if (key < todayKey) urgency = 'overdue';
+        else if (key === todayKey) urgency = 'today';
+
+        if (urgency) {
+          reminders.push({
+            type: 'nextAction',
+            urgency,
+            dealId: deal.id,
+            leadId: deal.leadId,
+            ownerName: deal.ownerName || null,
+            leadName: deal.leadName || null,
+            dealTitle: deal.title,
+            nextAction: deal.nextAction || null,
+            dueDate: deal.nextActionDate || null,
+          });
+        }
+      }
+    }
+
+    const steps = await new Promise((resolve, reject) => {
+      getOutreachStepsForDeal(deal.id, (err, rows) => {
+        if (err) return reject(err);
+        resolve(rows || []);
+      });
+    });
+
+    steps
+      .filter((step) => step && step.status === 'pending')
+      .forEach((step) => {
+        const stepDate = step.dueDate ? new Date(step.dueDate) : null;
+        if (!stepDate || Number.isNaN(stepDate.getTime())) return;
+
+        const key = toDateKey(stepDate);
+        let urgency = null;
+        if (key < todayKey) urgency = 'overdue';
+        else if (key === todayKey) urgency = 'today';
+
+        if (!urgency) return;
+
+        reminders.push({
+          type: 'outreachStep',
+          urgency,
+          dealId: deal.id,
+          leadId: deal.leadId,
+          ownerName: deal.ownerName || null,
+          leadName: deal.leadName || null,
+          dealTitle: deal.title,
+          channel: step.channel,
+          intent: step.intent,
+          goal: step.goal,
+          dueDate: step.dueDate,
+        });
+      });
+  }
+
+  return reminders;
+}
+
+const DEFAULT_REMINDER_SETTINGS = {
+  remindersEnabled: false,
+  reminderChannel: 'email',
+};
+
+function getReminderSettings() {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT value FROM settings WHERE key = ?', ['reminders'], (err, row) => {
+      if (err) return reject(err);
+      if (!row || !row.value) {
+        return resolve({ ...DEFAULT_REMINDER_SETTINGS });
+      }
+      try {
+        const parsed = JSON.parse(row.value);
+        resolve({
+          ...DEFAULT_REMINDER_SETTINGS,
+          ...parsed,
+        });
+      } catch (parseErr) {
+        console.warn('Failed to parse reminder settings, using defaults:', parseErr);
+        resolve({ ...DEFAULT_REMINDER_SETTINGS });
+      }
+    });
+  });
+}
+
+async function saveReminderSettings(partial) {
+  const current = await getReminderSettings();
+  const next = {
+    ...current,
+    ...(partial || {}),
+  };
+  const value = JSON.stringify(next);
+
+  return new Promise((resolve, reject) => {
+    db.run(
+      'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+      ['reminders', value],
+      (err) => {
+        if (err) return reject(err);
+        resolve(next);
+      },
+    );
+  });
+}
+
 function createOutreachSteps(steps, callback) {
   if (!Array.isArray(steps) || steps.length === 0) {
     return callback(null);
@@ -889,4 +1107,10 @@ module.exports = {
   getOutreachStepsForDeal,
   createOutreachSteps,
   updateOutreachStepStatus,
+  getPendingOutreachStepsDueToday,
+  updateLeadOwnerName,
+  updateDealsOwnerForLead,
+  getImportantRemindersForToday,
+  getReminderSettings,
+  saveReminderSettings,
 };
