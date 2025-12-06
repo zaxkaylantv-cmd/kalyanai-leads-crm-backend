@@ -3,6 +3,8 @@ const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
 const { v4: uuidv4 } = require('uuid');
 
+const DEFAULT_OWNER_NAME = 'Zax Kalyan';
+
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_PATH = path.join(DATA_DIR, 'leads-crm.sqlite');
 
@@ -160,7 +162,7 @@ function createLead(lead, callback) {
   const ownerValue =
     ownerName && typeof ownerName === 'string' && ownerName.trim()
       ? ownerName.trim()
-      : 'Unassigned';
+      : DEFAULT_OWNER_NAME;
 
   db.run(
     `
@@ -321,7 +323,7 @@ function createDeal(deal, callback) {
   const ownerValue =
     ownerName && typeof ownerName === 'string' && ownerName.trim()
       ? ownerName.trim()
-      : 'Unassigned';
+      : DEFAULT_OWNER_NAME;
 
   db.run(
     `

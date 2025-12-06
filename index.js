@@ -40,6 +40,8 @@ const {
   SMTP_PASS,
 } = process.env;
 
+const DEFAULT_OWNER_NAME = 'Zax Kalyan';
+
 let mailTransporter = null;
 
 function getMailTransporter() {
@@ -361,7 +363,7 @@ app.post('/deals', (req, res) => {
     nextActionDate: nextActionDate || null,
     reminderChannel: typeof reminderChannel === 'string' ? reminderChannel.trim() : null,
     aiAutoReminderEnabled: !!aiAutoReminderEnabled,
-    ownerName: ownerName && typeof ownerName === 'string' ? ownerName : 'Unassigned',
+    ownerName: ownerName && typeof ownerName === 'string' ? ownerName : DEFAULT_OWNER_NAME,
   };
 
   createDeal(dealInput, (err, createdDeal) => {
@@ -814,6 +816,48 @@ app.post('/deals/:dealId/stage', (req, res) => {
   });
 });
 
+function ensureInitialDealForLead(lead, callback) {
+  if (!lead || !lead.id) {
+    return callback(new Error('Lead data missing for initial deal creation'));
+  }
+
+  db.all('SELECT id FROM deals WHERE leadId = ? LIMIT 1', [lead.id], (checkErr, rows) => {
+    if (checkErr) {
+      console.error('Error checking existing deals for lead:', checkErr);
+      return callback(checkErr);
+    }
+
+    if (rows && rows.length > 0) {
+      return callback(null, { created: false });
+    }
+
+    const titleBase =
+      (lead.company && typeof lead.company === 'string' && lead.company.trim()) ||
+      (lead.name && typeof lead.name === 'string' && lead.name.trim());
+    const title = titleBase ? `${titleBase} - initial deal` : 'Initial deal';
+
+    const dealInput = {
+      leadId: lead.id,
+      title,
+      stage: 'New',
+      value: typeof lead.value === 'number' ? lead.value : 0,
+      nextAction: null,
+      nextActionDate: null,
+      reminderChannel: null,
+      aiAutoReminderEnabled: false,
+      ownerName: lead.ownerName,
+    };
+
+    createDeal(dealInput, (createErr) => {
+      if (createErr) {
+        console.error('Error creating initial deal for lead:', createErr);
+        return callback(createErr);
+      }
+      callback(null, { created: true });
+    });
+  });
+}
+
 app.post('/leads', (req, res) => {
   const {
     name,
@@ -844,7 +888,7 @@ app.post('/leads', (req, res) => {
     createdAt,
     address,
     phone,
-    ownerName: ownerName && typeof ownerName === 'string' ? ownerName : 'Unassigned',
+    ownerName: ownerName && typeof ownerName === 'string' ? ownerName : DEFAULT_OWNER_NAME,
   };
 
   createLead(lead, (err) => {
@@ -861,7 +905,14 @@ app.post('/leads', (req, res) => {
           .json({ error: 'Lead created but failed to fetch' });
       }
 
-      res.status(201).json(row);
+      ensureInitialDealForLead(row, (dealErr) => {
+        if (dealErr) {
+          return res
+            .status(500)
+            .json({ error: 'Lead created but failed to create initial deal' });
+        }
+        res.status(201).json(row);
+      });
     });
   });
 });
