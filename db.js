@@ -141,7 +141,9 @@ function initialiseDb() {
       if (err) {
         console.error('Failed to ensure owner columns exist:', err);
       }
-      seedDemoData();
+      if (process.env.SEED_DEMO_DATA === '1') {
+        seedDemoData();
+      }
     });
   });
 }
